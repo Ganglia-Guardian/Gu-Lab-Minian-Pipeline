@@ -8,7 +8,7 @@
 
 #Check Status
 function checkenv {
-  isEnv=$(conda list envs | grep "minian-gu-lab")
+  isEnv=$(conda env list| grep "minian-gu-lab")
   if [[ -z "$isEnv" ]]; then
     echo "It seems like the conda environment already exists (you may want to run startup.sh)! Do you still want to proceed? y/[n]"
     read -r -n 1 choice1

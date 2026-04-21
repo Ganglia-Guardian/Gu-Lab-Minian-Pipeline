@@ -6,7 +6,7 @@ function checkenv {
     if [[ "$choice1" = 'y' ]]; then
       return 0
     fi
-  else;
+  else
     echo "Minian environment found!"
   fi
 }

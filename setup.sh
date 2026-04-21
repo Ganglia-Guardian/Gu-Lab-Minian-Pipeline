@@ -8,12 +8,12 @@
 
 #Check Status
 function checkenv {
-  isEnv=$(conda env list| grep "minian-gu-lab")
+  isEnv=$(conda env list | grep "minian-gu-lab")
   if [[ -z "$isEnv" ]]; then
     echo "It seems like the conda environment already exists (you may want to run startup.sh)! Do you still want to proceed? y/[n]"
     read -r -n 1 choice1
     if [[ "$choice1" != 'y' ]]; then
-      return 0;
+      return 0
     fi
   fi
 }
@@ -29,6 +29,7 @@ conda activate minian-gu-lab
 # read -n 1 -s -r -p ""
 #ENDDEBUG
 pip install -e .
+pip install shot-scraper
 #Test minian
 if python st.py; then
   echo "Minian installation successful"

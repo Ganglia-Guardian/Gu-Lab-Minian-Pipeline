@@ -206,17 +206,22 @@ def load_avi_lazy_framewise(fname: str) -> darr.array:
     return da.array.stack(arr, axis=0)
 
 
-def load_avi_lazy(fname: str) -> darr.array:
+def load_avi_lazy(fname: str, n_chunks: int = 10) -> darr.array:
     """
-    Lazy load an avi video.
+    Lazy load an avi video using parallel chunked ffmpeg decodes.
 
-    This function construct a single delayed task for loading the video as a
-    whole.
+    Splits the frame range into `n_chunks` disjoint segments and constructs one
+    delayed task per segment, each invoking ffmpeg with `-ss` (input seek) and
+    `-vframes` to decode only its slice. Concatenating the results lets
+    independent workers decode the file in parallel.
 
     Parameters
     ----------
     fname : str
         The filename of the video to load.
+    n_chunks : int, optional
+        Number of parallel decode tasks to create. Clamped to `[1, nframes]`.
+        By default `10`.
 
     Returns
     -------
@@ -228,17 +233,35 @@ def load_avi_lazy(fname: str) -> darr.array:
     w = int(video_info["width"])
     h = int(video_info["height"])
     f = int(video_info["nb_frames"])
-    return da.array.from_delayed(
-        da.delayed(load_avi_ffmpeg)(fname, h, w, f), dtype=np.uint8, shape=(f, h, w)
-    )
+    fps_str = video_info.get("avg_frame_rate") or video_info.get("r_frame_rate", "30/1")
+    num, denom = fps_str.split("/")
+    fps = float(num) / float(denom) if float(denom) else 30.0
+
+    n_chunks = max(1, min(int(n_chunks), f))
+    chunk_size = int(np.ceil(f / n_chunks))
+    arrs = []
+    for start in range(0, f, chunk_size):
+        nframes = min(chunk_size, f - start)
+        start_time = start / fps
+        arrs.append(
+            darr.from_delayed(
+                da.delayed(load_avi_ffmpeg)(fname, h, w, nframes, start_time),
+                dtype=np.uint8,
+                shape=(nframes, h, w),
+            )
+        )
+    return darr.concatenate(arrs, axis=0)
 
 
-def load_avi_ffmpeg(fname: str, h: int, w: int, f: int) -> np.ndarray:
+def load_avi_ffmpeg(
+    fname: str, h: int, w: int, f: int, start_time: float = 0.0
+) -> np.ndarray:
     """
-    Load an avi video using `ffmpeg`.
+    Load a frame range of an avi video using `ffmpeg`.
 
-    This function directly invoke `ffmpeg` using the `python-ffmpeg` wrapper and
-    retrieve the data from buffer.
+    Invokes `ffmpeg` via the `python-ffmpeg` wrapper with input-side `-ss`
+    seeking and `-vframes` to emit a raw grayscale buffer for a single slice of
+    the video.
 
     Parameters
     ----------
@@ -249,19 +272,32 @@ def load_avi_ffmpeg(fname: str, h: int, w: int, f: int) -> np.ndarray:
     w : int
         The width of the video.
     f : int
-        The number of frames in the video.
+        The number of frames to decode from `start_time`.
+    start_time : float, optional
+        Seek offset in seconds, passed as input `-ss`. By default `0.0`.
 
     Returns
     -------
     arr : np.ndarray
-        The resulting array. Has shape (`f`, `h`, `w`).
+        The resulting array. Has shape (`f`, `h`, `w`). If ffmpeg returns fewer
+        frames than requested (e.g. at end-of-stream), the tail is zero-padded.
     """
-    out_bytes, err = (
-        ffmpeg.input(fname)
-        .video.output("pipe:", format="rawvideo", pix_fmt="gray")
+    if start_time > 0:
+        stream = ffmpeg.input(fname, ss=start_time)
+    else:
+        stream = ffmpeg.input(fname)
+    out_bytes, _ = (
+        stream.video.output("pipe:", format="rawvideo", pix_fmt="gray", vframes=f)
         .run(capture_stdout=True)
     )
-    return np.frombuffer(out_bytes, np.uint8).reshape(f, h, w)
+    arr = np.frombuffer(out_bytes, np.uint8)
+    n_actual = arr.size // (h * w)
+    if n_actual >= f:
+        return arr[: f * h * w].reshape(f, h, w).copy()
+    out = np.zeros((f, h, w), dtype=np.uint8)
+    if n_actual > 0:
+        out[:n_actual] = arr[: n_actual * h * w].reshape(n_actual, h, w)
+    return out
 
 
 def load_avi_perframe(fname: str, fid: int) -> np.ndarray:

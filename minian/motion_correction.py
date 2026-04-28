@@ -13,6 +13,14 @@ from skimage.registration import phase_cross_correlation
 
 from .utilities import custom_arr_optimize, xrconcat_recursive
 
+try:
+    import cupy as cp
+
+    _HAS_GPU = True
+except ImportError:
+    cp = None
+    _HAS_GPU = False
+
 
 def estimate_motion(
     varr: xr.DataArray, dim="frame", npart=3, chunk_nfm: Optional[int] = None, **kwargs
@@ -208,13 +216,22 @@ def est_motion_part(
     if chunk_nfm is None:
         chunk_nfm = varr.chunksize[0]
     varr = varr.rechunk((chunk_nfm, None, None))
+    use_gpu = kwargs.pop("use_gpu", False)
+    if use_gpu and not _HAS_GPU:
+        raise RuntimeError(
+            "use_gpu=True but cupy is not installed. "
+            "Install cupy matching your CUDA toolkit: "
+            "`pip install cupy-cuda11x` for CUDA 11.x, "
+            "or `pip install cupy-cuda12x` for CUDA 12.x."
+        )
+    target = est_motion_chunk_gpu if use_gpu else est_motion_chunk
     arr_opt = fct.partial(custom_arr_optimize, keep_patterns=["^est_motion_chunk"])
     if kwargs.get("mesh_size", None):
         param = get_bspline_param(varr[0].compute(), kwargs["mesh_size"])
     tmp_ls = []
     sh_ls = []
     for blk in varr.blocks:
-        res = da.delayed(est_motion_chunk)(
+        res = da.delayed(target)(
             blk, None, alt_error=alt_error, npart=npart, **kwargs
         )
         if alt_error:
@@ -245,7 +262,7 @@ def est_motion_part(
             tmps = temps.blocks[idx : idx + npart]
             sh_org = shifts.blocks[idx : idx + npart]
             sh_org_ls = [sh_org.blocks[i] for i in range(sh_org.numblocks[0])]
-            res = da.delayed(est_motion_chunk)(
+            res = da.delayed(target)(
                 tmps, sh_org_ls, alt_error=alt_error, npart=npart, **kwargs
             )
             if alt_error:
@@ -471,6 +488,292 @@ def est_motion_chunk(
             [motions[i] + sh for i, sh in enumerate(sh_org)], axis=0
         )
     return tmp, motions
+
+
+def est_motion_chunk_gpu(
+    varr,
+    sh_org,
+    npart: int,
+    alt_error: float,
+    aggregation: str = "mean",
+    upsample: int = 100,
+    max_sh: int = 100,
+    circ_thres: Optional[float] = None,
+    mesh_size: Optional[Tuple[int, int]] = None,
+    niter: int = 100,
+    bin_thres: Optional[float] = None,
+):
+    """GPU port of :func:`est_motion_chunk`.
+
+    Same call signature and return contract. Uploads the chunk to GPU once,
+    keeps tensors there across the recursion, and replaces the per-frame
+    ``phase_cross_correlation`` loop with a batched cupy implementation.
+    Falls back to the CPU path when ``mesh_size is not None`` (BSpline /
+    SimpleITK has no clean GPU equivalent).
+    """
+    if mesh_size is not None:
+        return est_motion_chunk(
+            varr, sh_org, npart, alt_error, aggregation, upsample, max_sh,
+            circ_thres, mesh_size, niter, bin_thres,
+        )
+    if not _HAS_GPU:
+        raise RuntimeError("est_motion_chunk_gpu called but cupy is not installed")
+
+    in_dtype = varr.dtype if isinstance(varr, np.ndarray) else None
+    if isinstance(varr, np.ndarray):
+        varr_g = cp.asarray(varr, dtype=cp.float32)
+    else:
+        varr_g = varr.astype(cp.float32)
+
+    tmp_g, motions_g = _gpu_chunk_recurse(
+        varr_g, sh_org, npart, alt_error, aggregation, upsample, max_sh,
+        circ_thres, bin_thres,
+    )
+
+    tmp_np = cp.asnumpy(tmp_g)
+    if in_dtype is not None and np.issubdtype(in_dtype, np.integer):
+        info = np.iinfo(in_dtype)
+        tmp_np = np.clip(tmp_np, info.min, info.max).astype(in_dtype)
+    motions_np = cp.asnumpy(motions_g).astype(np.float64)
+    return tmp_np, motions_np
+
+
+def _gpu_chunk_recurse(
+    varr_g, sh_org, npart, alt_error, aggregation, upsample, max_sh,
+    circ_thres, bin_thres,
+):
+    if varr_g.ndim == 3 and varr_g.shape[0] == 1:
+        if sh_org is not None:
+            motions = sh_org if isinstance(sh_org, cp.ndarray) else cp.asarray(sh_org)
+        else:
+            motions = cp.zeros((1, 2), dtype=cp.float32)
+        if alt_error:
+            tmp = cp.stack([varr_g[0], varr_g[0], varr_g[0]], axis=0)
+        else:
+            tmp = varr_g[0]
+        return tmp, motions
+
+    while varr_g.shape[0] > npart:
+        part_idx = np.array_split(
+            np.arange(varr_g.shape[0]),
+            int(np.ceil(varr_g.shape[0] / npart)),
+        )
+        tmp_ls, sh_ls = [], []
+        for idx in part_idx:
+            sub_sh = [sh_org[i] for i in idx] if sh_org is not None else None
+            cur_tmp, cur_motions = _gpu_chunk_recurse(
+                varr_g[idx], sub_sh, npart, alt_error, aggregation,
+                upsample, max_sh, circ_thres, bin_thres,
+            )
+            tmp_ls.append(cur_tmp)
+            sh_ls.append(cur_motions)
+        varr_g = cp.stack(tmp_ls, axis=0)
+        sh_org = sh_ls
+
+    return _gpu_estimate_block(
+        varr_g, sh_org, alt_error, aggregation, upsample, max_sh,
+        circ_thres, bin_thres,
+    )
+
+
+def _gpu_estimate_block(
+    varr_g, sh_org, alt_error, aggregation, upsample, max_sh,
+    circ_thres, bin_thres,
+):
+    is_template = varr_g.ndim > 3
+    n = varr_g.shape[0]
+
+    good_fm = cp.ones(n, dtype=cp.bool_)
+    if circ_thres is not None and not is_template:
+        # check_temp uses cv2; pull frames briefly to host for the quality check.
+        # Only fires when the user opts in to circ_thres (uncommon in defaults).
+        varr_cpu = cp.asnumpy(varr_g)
+        good = np.array(
+            [check_temp(fm, max_sh) > circ_thres for fm in varr_cpu], dtype=bool,
+        )
+        good_fm = cp.asarray(good)
+        prop_good = float(good_fm.mean())
+        if prop_good < 0.9:
+            warnings.warn(
+                "only {} of the frames are good."
+                "Consider lowering your circularity threshold".format(prop_good)
+            )
+
+    good_idxs = cp.where(good_fm)[0]
+    good_idxs_cpu = cp.asnumpy(good_idxs).astype(int)
+    mid = int(good_idxs_cpu[np.abs(good_idxs_cpu - n / 2).argmin()])
+
+    pair_i, src_idx, dst_idx = [], [], []
+    alt_src_idx, alt_dst_idx = [], []
+    for i in range(n):
+        if i == mid:
+            continue
+        if is_template:
+            j = i + 1 if i < mid else i - 1
+            src_idx.append((i, 1))
+            dst_idx.append((j, 1))
+            if alt_error:
+                alt_src_idx.append((i, 2 if i < mid else 0))
+                alt_dst_idx.append((j, 0 if i < mid else 2))
+        else:
+            if i < mid:
+                didx = int(good_idxs_cpu[good_idxs_cpu - (i + 1) >= 0][0])
+            else:
+                didx = int(good_idxs_cpu[good_idxs_cpu - (i - 1) <= 0][-1])
+            src_idx.append((i,))
+            dst_idx.append((didx,))
+        pair_i.append(i)
+
+    motions = cp.zeros((n, 2), dtype=cp.float32)
+
+    if pair_i:
+        if is_template:
+            src = cp.stack([varr_g[i, ch] for (i, ch) in src_idx], axis=0)
+            dst = cp.stack([varr_g[j, ch] for (j, ch) in dst_idx], axis=0)
+        else:
+            src = cp.stack([varr_g[i] for (i,) in src_idx], axis=0)
+            dst = cp.stack([varr_g[j] for (j,) in dst_idx], axis=0)
+        shifts = _batched_phase_correlation(src, dst, upsample)
+
+        if alt_error and is_template and alt_src_idx:
+            src_a = cp.stack([varr_g[i, ch] for (i, ch) in alt_src_idx], axis=0)
+            dst_a = cp.stack([varr_g[j, ch] for (j, ch) in alt_dst_idx], axis=0)
+            shifts_alt = _batched_phase_correlation(src_a, dst_a, upsample)
+            diff_big = (cp.abs(shifts - shifts_alt) > alt_error).any(axis=-1)
+            prefer_alt = (
+                cp.abs(shifts).sum(axis=-1) > cp.abs(shifts_alt).sum(axis=-1)
+            )
+            replace = (diff_big & prefer_alt)[:, None]
+            shifts = cp.where(replace, shifts_alt, shifts)
+
+        good_fm_cpu = cp.asnumpy(good_fm)
+        for k, i in enumerate(pair_i):
+            slc = slice(0, i + 1) if i < mid else slice(i, None)
+            if good_fm_cpu[i]:
+                motions[slc] = motions[slc] + shifts[k][None, :]
+            else:
+                motions[i] = motions[i] + shifts[k]
+
+    motions = motions - motions.mean(axis=0, keepdims=True)
+
+    if is_template:
+        for j in range(varr_g.shape[1]):
+            varr_g[:, j] = _gpu_shift_batch(varr_g[:, j], motions, fill=0.0)
+    else:
+        varr_g = _gpu_shift_batch(varr_g, motions, fill=0.0)
+
+    varr_g = varr_g[good_idxs]
+    if aggregation == "max":
+        tmp = varr_g.max(axis=(0, 1) if is_template else 0)
+    elif aggregation == "mean":
+        tmp = varr_g.mean(axis=(0, 1) if is_template else 0)
+    else:
+        raise ValueError("does not understand aggregation: {}".format(aggregation))
+
+    if alt_error:
+        if is_template:
+            tmp0 = varr_g[0, 0]
+            tmp1 = varr_g[-1, -1]
+        else:
+            tmp0 = varr_g[0]
+            tmp1 = varr_g[-1] if varr_g.shape[0] > 1 else varr_g[0]
+        tmp = cp.stack([tmp0, tmp, tmp1], axis=0)
+
+    if sh_org is not None:
+        pieces = []
+        for k, s in enumerate(sh_org):
+            s_g = s if isinstance(s, cp.ndarray) else cp.asarray(s)
+            pieces.append(motions[k] + s_g)
+        motions = cp.concatenate(pieces, axis=0)
+
+    return tmp, motions
+
+
+def _batched_phase_correlation(src, dst, upsample):
+    """Batched, GPU-resident equivalent of skimage.registration.phase_cross_correlation.
+
+    Returns shifts in the same sign convention as the existing CPU
+    ``est_motion_perframe`` (i.e. negated relative to skimage's output),
+    shape ``(B, 2)`` with axes ``[row, col]``.
+    """
+    B, H, W = src.shape
+    Fs = cp.fft.fft2(src)
+    Fd = cp.fft.fft2(dst)
+    R = Fs * cp.conj(Fd)
+    eps = float(cp.finfo(R.real.dtype).eps)
+    R_norm = R / cp.maximum(cp.abs(R), 100 * eps)
+    cc = cp.abs(cp.fft.ifft2(R_norm))
+
+    flat = cc.reshape(B, -1).argmax(axis=1)
+    py = (flat // W).astype(cp.float32)
+    px = (flat % W).astype(cp.float32)
+    py = cp.where(py > H // 2, py - H, py)
+    px = cp.where(px > W // 2, px - W, px)
+    shifts = cp.stack([py, px], axis=-1)
+
+    if upsample == 1:
+        return -shifts
+
+    shifts = cp.round(shifts * upsample) / upsample
+    ups_size = int(np.ceil(upsample * 1.5))
+    dftshift = float(np.fix(ups_size / 2.0))
+    sample_offsets = dftshift - shifts * upsample
+
+    cc_up = cp.abs(
+        _batched_upsampled_dft(cp.conj(R_norm), ups_size, upsample, sample_offsets)
+    )
+    flat_up = cc_up.reshape(B, -1).argmax(axis=1)
+    my = (flat_up // ups_size).astype(cp.float32) - dftshift
+    mx = (flat_up % ups_size).astype(cp.float32) - dftshift
+    refine = cp.stack([my, mx], axis=-1) / upsample
+    return -(shifts + refine)
+
+
+def _batched_upsampled_dft(R, ups_size, upsample, sample_offsets):
+    """Direct port of ``skimage.registration._phase_cross_correlation._upsampled_dft``,
+    batched over the leading axis. Computes a small matrix-DFT around the
+    coarse peak for sub-pixel refinement.
+    """
+    B, H, W = R.shape
+    im2pi = cp.complex64(-2j * np.pi)
+    ups = cp.arange(ups_size, dtype=cp.float32)
+
+    col_freq = cp.fft.fftfreq(W).astype(cp.float32) / cp.float32(upsample)
+    kw = (
+        ups[None, :, None] - sample_offsets[:, 1, None, None]
+    ) * col_freq[None, None, :]
+    kw = cp.exp(im2pi * kw)
+    R1 = cp.einsum("bhw,buw->bhu", R, kw)
+
+    row_freq = cp.fft.fftfreq(H).astype(cp.float32) / cp.float32(upsample)
+    kh = (
+        ups[None, :, None] - sample_offsets[:, 0, None, None]
+    ) * row_freq[None, None, :]
+    kh = cp.exp(im2pi * kh)
+    R2 = cp.einsum("bhu,bvh->bvu", R1, kh)
+    return R2
+
+
+def _gpu_shift_batch(frames, motions, fill=0.0):
+    """Batched equivalent of :func:`shift_perframe`: rounded integer roll
+    plus zero-fill of the wrap-around region."""
+    sh = cp.around(motions).astype(cp.int32)
+    sh_cpu = cp.asnumpy(sh)
+    out = cp.empty_like(frames)
+    for k in range(frames.shape[0]):
+        s0 = int(sh_cpu[k, 0])
+        s1 = int(sh_cpu[k, 1])
+        f = cp.roll(frames[k], (s0, s1), axis=(0, 1))
+        if s0 > 0:
+            f[:s0] = fill
+        elif s0 < 0:
+            f[s0:] = fill
+        if s1 > 0:
+            f[:, :s1] = fill
+        elif s1 < 0:
+            f[:, s1:] = fill
+        out[k] = f
+    return out
 
 
 def est_motion_perframe(

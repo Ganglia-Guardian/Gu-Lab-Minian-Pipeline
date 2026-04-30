@@ -15,10 +15,12 @@ from .utilities import custom_arr_optimize, xrconcat_recursive
 
 try:
     import cupy as cp
+    import cupyx.scipy.ndimage as cp_ndi
 
     _HAS_GPU = True
 except ImportError:
     cp = None
+    cp_ndi = None
     _HAS_GPU = False
 
 
@@ -971,7 +973,11 @@ def get_mask(fm, bin_thres, bin_wnd):
 
 
 def apply_transform(
-    varr: xr.DataArray, trans: xr.DataArray, fill=0, mesh_size: Tuple[int, int] = None
+    varr: xr.DataArray,
+    trans: xr.DataArray,
+    fill=0,
+    mesh_size: Tuple[int, int] = None,
+    use_gpu: bool = False,
 ) -> xr.DataArray:
     """
     Apply necessary transform to correct for motion.
@@ -995,6 +1001,10 @@ def apply_transform(
         `mesh_size` parameter used when estimating motion. Only used if
         `trans.ndim > 2`. If `None` and `trans.ndim > 2` then one will be
         computed using :func:`get_mesh_size`. By default `None`.
+    use_gpu : bool, optional
+        If True, apply rigid translations on GPU via cupy. The BSpline path has
+        no clean cupy equivalent and silently falls back to CPU. By default
+        `False`.
 
     Returns
     -------
@@ -1002,7 +1012,8 @@ def apply_transform(
         Movie data after transform.
     """
     sh_dim = trans.coords["shift_dim"].values.tolist()
-    if "grid0" in trans.dims:
+    is_bspline = "grid0" in trans.dims
+    if is_bspline:
         fm0 = varr.isel(frame=0).values
         if mesh_size is None:
             mesh_size = get_mesh_size(fm0)
@@ -1011,18 +1022,102 @@ def apply_transform(
     else:
         param = None
         mdim = ["shift_dim"]
+    if use_gpu and is_bspline:
+        # SimpleITK BSpline resample has no clean cupy equivalent — fall back.
+        use_gpu = False
+    if use_gpu and not _HAS_GPU:
+        raise RuntimeError(
+            "use_gpu=True but cupy is not installed. "
+            "Install cupy matching your CUDA toolkit: "
+            "`pip install cupy-cuda11x` for CUDA 11.x, "
+            "or `pip install cupy-cuda12x` for CUDA 12.x."
+        )
+    func = transform_chunk_gpu if use_gpu else transform_chunk
     varr_sh = xr.apply_ufunc(
-        transform_perframe,
+        func,
         varr.chunk({d: -1 for d in sh_dim}),
         trans,
         input_core_dims=[sh_dim, mdim],
         output_core_dims=[sh_dim],
-        vectorize=True,
         dask="parallelized",
         kwargs={"fill": fill, "param": param},
         output_dtypes=[varr.dtype],
     )
     return varr_sh
+
+
+def transform_chunk(
+    fm_chunk: np.ndarray,
+    tx_chunk: np.ndarray,
+    fill=0,
+    param: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Apply transforms to a chunk of frames on CPU.
+
+    Batched replacement for the per-frame ``vectorize=True`` loop: each dask
+    block now pays Python overhead once instead of once per frame. Defers to
+    :func:`transform_perframe` for the actual SITK resample so rigid and
+    BSpline behavior is bit-identical to the prior implementation.
+
+    Parameters
+    ----------
+    fm_chunk : np.ndarray
+        Frames in the chunk, shape ``(F, H, W)``.
+    tx_chunk : np.ndarray
+        Per-frame transforms, shape ``(F, 2)`` for rigid or
+        ``(F, 2, G0, G1)`` for BSpline.
+
+    Returns
+    -------
+    out : np.ndarray
+        Transformed frames, same shape and dtype as ``fm_chunk``.
+    """
+    out = np.empty_like(fm_chunk)
+    for i in range(fm_chunk.shape[0]):
+        out[i] = transform_perframe(
+            fm_chunk[i], tx_chunk[i], fill=fill, param=param,
+        )
+    return out
+
+
+def transform_chunk_gpu(
+    fm_chunk: np.ndarray,
+    tx_chunk: np.ndarray,
+    fill=0,
+    param: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """GPU port of :func:`transform_chunk` for rigid translations.
+
+    Uploads the chunk once, applies sub-pixel-accurate bilinear shifts via
+    :func:`cupyx.scipy.ndimage.shift` (``order=1``), downloads once. Falls
+    back to the CPU path for BSpline transforms (``tx_chunk.ndim > 2``) since
+    SimpleITK BSpline resample has no clean cupy equivalent.
+
+    Sub-pixel shifts are honored — unlike :func:`_gpu_shift_batch` which
+    rounds to integers for the template-generation inner loop.
+    """
+    if tx_chunk.ndim > 2:
+        return transform_chunk(fm_chunk, tx_chunk, fill=fill, param=param)
+    if not _HAS_GPU:
+        raise RuntimeError(
+            "transform_chunk_gpu called but cupy is not installed"
+        )
+    in_dtype = fm_chunk.dtype
+    fm_g = cp.asarray(fm_chunk, dtype=cp.float32)
+    sh_g = cp.asarray(tx_chunk, dtype=cp.float32)
+    out_g = cp.empty_like(fm_g)
+    cval = float(fill)
+    for i in range(fm_g.shape[0]):
+        out_g[i] = cp_ndi.shift(
+            fm_g[i], sh_g[i], order=1, mode="constant", cval=cval,
+        )
+    out_np = cp.asnumpy(out_g)
+    if np.issubdtype(in_dtype, np.integer):
+        info = np.iinfo(in_dtype)
+        out_np = np.clip(out_np, info.min, info.max).astype(in_dtype)
+    else:
+        out_np = out_np.astype(in_dtype)
+    return out_np
 
 
 def transform_perframe(

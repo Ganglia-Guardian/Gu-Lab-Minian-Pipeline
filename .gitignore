@@ -142,3 +142,6 @@ minian_intermediate*/
 /*.eps
 /*.mat
 /hypertuning_*.png
+
+# personal notebook copies (see Minian_pipeline_TEMPLATE.ipynb)
+*_local.ipynb

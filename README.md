@@ -81,15 +81,14 @@ python -m playwright install chromium
 
 ## Working with Notebooks
 
-The optimized pipeline notebooks are located in the `notebooks/` directory. To start working:
+`Minian_pipeline_TEMPLATE.ipynb` is the shared pipeline notebook. **Never edit or run the template itself.** It is updated by `git pull`, and any local edits to it will block the next pull.
 
-1. Ensure the `minian-gu-lab` environment is activated
-2. Launch Jupyter from the project root:
-   ```bash
-   jupyter notebook
-   ```
-   Or use VS Code's built-in Jupyter support
-3. Navigate to `notebooks/` and open the pipeline notebook you need
+1. Make a copy of the template **in the project root** (next to `minian/` and `manual_curation_update.py`, so the imports work) with a name ending in `_local.ipynb`, e.g. `Minian_pipeline_YOURNAME_local.ipynb`.
+   Files ending in `_local.ipynb` are ignored by git, so pulls never change them and they never show up as changes.
+2. Open your copy in VS Code and select the **Python (minian-gu-lab)** kernel (top right).
+3. Set your paths, video pattern and parameters in your copy.
+
+When a pull updates the template, either make a fresh copy and re-enter your settings, or move the changed cells into your existing copy.
 
 ## Project Structure
 
@@ -189,10 +188,19 @@ If you encounter issues not listed here:
 
 To get the latest changes from the main repository:
 
-```bash
-git checkout main
-git pull origin main
-```
+1. Check that nothing tracked has been edited locally:
+   ```bash
+   git status
+   ```
+   If git lists modified tracked files (for example the template notebook), save a copy of anything you need and discard or stash them (`git stash`), otherwise the pull will stop with "Your local changes would be overwritten". Your `_local.ipynb` copies and pipeline outputs are not affected.
+
+2. Pull:
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+3. Restart the notebook kernel so the updated source code is loaded.
 
 Then update your conda environment if `environment.yml` has changed:
 

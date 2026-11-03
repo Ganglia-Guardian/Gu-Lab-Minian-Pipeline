@@ -134,3 +134,11 @@ build_artifacts
 
 # minian intermediate
 minian_intermediate
+
+# pipeline outputs written to the repo root
+minian_intermediate*/
+/miniscope_test/
+/*.csv
+/*.eps
+/*.mat
+/hypertuning_*.png

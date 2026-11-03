@@ -23,6 +23,60 @@ except ImportError:
     cp_ndi = None
     _HAS_GPU = False
 
+_GPU_USABLE = None
+
+
+def gpu_available() -> bool:
+    """
+    Check whether GPU acceleration can actually be used on this machine.
+
+    Requires cupy to be importable, at least one CUDA device to be visible and
+    a small array operation to succeed on it. The result is cached.
+
+    Returns
+    -------
+    usable : bool
+        Whether GPU code paths can be used.
+    """
+    global _GPU_USABLE
+    if _GPU_USABLE is None:
+        _GPU_USABLE = False
+        if _HAS_GPU:
+            try:
+                if cp.cuda.runtime.getDeviceCount() > 0:
+                    _GPU_USABLE = bool(cp.asnumpy(cp.arange(4).sum()) == 6)
+            except Exception:
+                _GPU_USABLE = False
+    return _GPU_USABLE
+
+
+def resolve_use_gpu(use_gpu) -> bool:
+    """
+    Resolve a `use_gpu` setting into a boolean.
+
+    Parameters
+    ----------
+    use_gpu : bool, str or None
+        `"auto"` or `None` selects the GPU only if :func:`gpu_available`.
+        `True` requires a usable GPU and raises otherwise. `False` always uses
+        the CPU.
+
+    Returns
+    -------
+    use_gpu : bool
+        Whether GPU code paths should be used.
+    """
+    if use_gpu is None or (isinstance(use_gpu, str) and use_gpu.lower() == "auto"):
+        return gpu_available()
+    if use_gpu and not gpu_available():
+        raise RuntimeError(
+            "use_gpu=True but no usable GPU was found. "
+            "Check that an NVIDIA GPU is present and cupy is installed "
+            "(`conda install -c conda-forge cupy cudatoolkit=11.8`), "
+            'or set use_gpu to "auto" to fall back to the CPU.'
+        )
+    return bool(use_gpu)
+
 
 def estimate_motion(
     varr: xr.DataArray, dim="frame", npart=3, chunk_nfm: Optional[int] = None, **kwargs
@@ -218,14 +272,7 @@ def est_motion_part(
     if chunk_nfm is None:
         chunk_nfm = varr.chunksize[0]
     varr = varr.rechunk((chunk_nfm, None, None))
-    use_gpu = kwargs.pop("use_gpu", False)
-    if use_gpu and not _HAS_GPU:
-        raise RuntimeError(
-            "use_gpu=True but cupy is not installed. "
-            "Install cupy matching your CUDA toolkit: "
-            "`pip install cupy-cuda11x` for CUDA 11.x, "
-            "or `pip install cupy-cuda12x` for CUDA 12.x."
-        )
+    use_gpu = resolve_use_gpu(kwargs.pop("use_gpu", False))
     target = est_motion_chunk_gpu if use_gpu else est_motion_chunk
     arr_opt = fct.partial(custom_arr_optimize, keep_patterns=["^est_motion_chunk"])
     if kwargs.get("mesh_size", None):
@@ -1025,13 +1072,7 @@ def apply_transform(
     if use_gpu and is_bspline:
         # SimpleITK BSpline resample has no clean cupy equivalent — fall back.
         use_gpu = False
-    if use_gpu and not _HAS_GPU:
-        raise RuntimeError(
-            "use_gpu=True but cupy is not installed. "
-            "Install cupy matching your CUDA toolkit: "
-            "`pip install cupy-cuda11x` for CUDA 11.x, "
-            "or `pip install cupy-cuda12x` for CUDA 12.x."
-        )
+    use_gpu = resolve_use_gpu(use_gpu)
     func = transform_chunk_gpu if use_gpu else transform_chunk
     varr_sh = xr.apply_ufunc(
         func,

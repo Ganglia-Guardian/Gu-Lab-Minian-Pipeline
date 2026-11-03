@@ -286,5 +286,5 @@ dependencies:
   - zstandard=0.23.0=py38hf92978b_0
   - zstd=1.5.6=h0ea2cb4_0
   - cudatoolkit=11.8
-  - cupy=11.6.0=cuda11x_py38_0
+  - cupy=11.6.0
 

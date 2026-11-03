@@ -9,13 +9,16 @@ from IPython.display import display, clear_output
 import io
 
 
-def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore=False, chunk_size=100):
+def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore=False, chunk_size=20):
     """
     Interactive neuron curation widget for Jupyter notebooks.
 
-    Displays neurons in chunks (default 100) with checkboxes to mark neurons
+    Displays neurons in chunks (default 20) with checkboxes to mark neurons
     for exclusion. Navigate chunks with Prev/Next buttons, then click Done
     to collect results.
+
+    Neuron images are rendered when their page is first shown and sized to the
+    display width, which keeps widget messages small enough for VS Code.
 
     Parameters
     ----------
@@ -30,7 +33,7 @@ def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore
     use_robust_zscore : bool
         If True, use median-based z-scoring for traces.
     chunk_size : int
-        Number of neurons per page (default 100). Set to -1 to display
+        Number of neurons per page (default 20). Set to -1 to display
         all neurons on a single page with no pagination.
 
     Returns
@@ -43,14 +46,16 @@ def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore
     n_units = A.shape[0]
     unit_ids = A.coords['unit_id'].values
 
-    # --- Pre-compute all neuron images as PNG bytes for speed ---
-    neuron_pngs = []
-    print(f"Pre-rendering {n_units} neurons...")
-
+    # --- Neuron images are rendered on demand and cached as PNG bytes ---
+    neuron_pngs = {}
+    max_proj = np.asarray(max_proj)
     max_proj_display = np.clip(max_proj, np.percentile(max_proj, 1), np.percentile(max_proj, 99))
 
-    for j in range(n_units):
-        fig, (ax_img, ax_zoom, ax_trace) = plt.subplots(1, 3, figsize=(20, 5))
+    def render_neuron(j):
+        if j in neuron_pngs:
+            return neuron_pngs[j]
+        # 15in x 75dpi ~= 1100px, the width the image is displayed at
+        fig, (ax_img, ax_zoom, ax_trace) = plt.subplots(1, 3, figsize=(15, 3.75))
 
         # --- Max projection + contour ---
         ax_img.imshow(max_proj_display, cmap='viridis')
@@ -108,15 +113,10 @@ def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore
 
         # Render to PNG bytes
         buf = io.BytesIO()
-        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        fig.savefig(buf, format='png', dpi=75, bbox_inches='tight')
         plt.close(fig)
-        buf.seek(0)
-        neuron_pngs.append(buf.read())
-
-        if (j + 1) % 50 == 0 or j == n_units - 1:
-            print(f"  Rendered {j + 1}/{n_units}")
-
-    print("Rendering complete. Launching widget...\n")
+        neuron_pngs[j] = buf.getvalue()
+        return neuron_pngs[j]
 
     # --- Build interactive widget ---
     if chunk_size == -1:
@@ -148,33 +148,35 @@ def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore
         cb.add_class('big-checkbox')
         checkboxes.append(cb)
 
-    output_area = widgets.Output(layout=widgets.Layout(overflow='visible', max_height='none'))
+    # Page content is swapped by replacing VBox children rather than calling
+    # display() inside an Output widget, which VS Code renders unreliably.
+    page_box = widgets.VBox(layout=widgets.Layout(overflow='visible'))
     status_label = widgets.HTML()
     result = {'good_units': None}
 
     def render_chunk(chunk_idx):
-        output_area.clear_output(wait=True)
         start = chunk_idx * chunk_size
         end = min(start + chunk_size, n_units)
+        status_label.value = f"<b>Rendering neurons {start + 1}–{end}...</b>"
+        rows = []
+        for j in range(start, end):
+            img_widget = widgets.Image(
+                value=render_neuron(j), format='png',
+                layout=widgets.Layout(width='1100px')
+            )
+            rows.append(widgets.HBox(
+                [img_widget, checkboxes[j]],
+                layout=widgets.Layout(
+                    align_items='center',
+                    margin='0 0 4px 0',
+                    border='solid 1px #ddd'
+                )
+            ))
+        page_box.children = rows
         status_label.value = (
             f"<b>Showing neurons {start + 1}–{end} of {n_units} "
             f"(Page {chunk_idx + 1}/{n_chunks})</b>"
         )
-        with output_area:
-            for j in range(start, end):
-                img_widget = widgets.Image(
-                    value=neuron_pngs[j], format='png',
-                    layout=widgets.Layout(width='1100px')
-                )
-                row = widgets.HBox(
-                    [img_widget, checkboxes[j]],
-                    layout=widgets.Layout(
-                        align_items='center',
-                        margin='0 0 4px 0',
-                        border='solid 1px #ddd'
-                    )
-                )
-                display(row)
 
     def on_prev(_):
         if current_chunk[0] > 0:
@@ -186,17 +188,17 @@ def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore
             current_chunk[0] += 1
             render_chunk(current_chunk[0])
 
-    done_output = widgets.Output()
+    done_label = widgets.HTML()
 
     def on_done(_):
         excluded = {unit_ids[j] for j, cb in enumerate(checkboxes) if cb.value}
         good = [uid for uid in unit_ids if uid not in excluded]
         result['good_units'] = good
-        with done_output:
-            clear_output()
-            print(f"Done! Kept {len(good)}/{n_units} neurons. "
-                  f"Excluded {len(excluded)}.")
-            print(f"Access kept IDs via the returned dict: result['good_units']")
+        done_label.value = (
+            f"<b>Done! Kept {len(good)}/{n_units} neurons. "
+            f"Excluded {len(excluded)}.</b><br>"
+            "Access kept IDs via the returned dict: result['good_units']"
+        )
 
     btn_prev = widgets.Button(description='← Prev', layout=widgets.Layout(width='100px'))
     btn_next = widgets.Button(description='Next →', layout=widgets.Layout(width='100px'))
@@ -220,9 +222,8 @@ def manual_curation_interactive(A, C, max_proj, spatial_shape, use_robust_zscore
         )
 
     render_chunk(0)
-    output_area.add_class('full-height-output')
     display(widgets.VBox(
-        [checkbox_style, nav_bar, output_area, done_output],
+        [checkbox_style, nav_bar, page_box, done_label],
         layout=widgets.Layout(overflow='visible', max_height='none')
     ))
 

@@ -8,6 +8,25 @@ A customized analysis pipeline and visualization tool for Miniscope data, based 
 - [Anaconda](https://www.anaconda.com/products/distribution) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html)
 - Git (usually comes with Anaconda/VS Code)
 
+## Quick Setup (Windows)
+
+After cloning (step 1 below), open the **Anaconda Prompt** or **Anaconda PowerShell Prompt**, go to the repo folder and run:
+
+```bash
+python setup_repo.py
+```
+
+This performs steps 3–8 below: it creates the `minian-gu-lab` environment, installs the repo, verifies minian, installs the plot-export tools, registers the Jupyter kernel, checks GPU/CUDA support and can create your personal `_local.ipynb` notebook copy. Run `python setup_repo.py --help` for options (for example `--update` after `environment.yml` changes).
+
+To re-check an existing environment at any time:
+
+```bash
+conda activate minian-gu-lab
+python env_test.py          # exit code 0 = minian and CUDA OK, 2 = no CUDA (CPU fallback), 1/3 = minian broken
+```
+
+The manual steps are below if you prefer them or the script fails.
+
 ## Setup Instructions
 
 ### 1. Clone the Repository
@@ -100,7 +119,10 @@ Gu-Lab-Minian-Pipeline/
 ├── img/                 # Images and figures
 ├── minian/              # Source code (modified for our lab)
 ├── notebooks/           # Optimized analysis notebooks
-├── environment.yml      # Conda environment specification
+├── environment.yml      # Conda environment (exact Windows builds, incl. CUDA/cupy)
+├── old.environment.yml  # Previous unpinned environment (non-Windows, CI)
+├── setup_repo.py        # One-step setup script
+├── env_test.py          # Checks minian install and CUDA support
 ├── setup.py            # Package installation configuration
 ├── pyproject.toml      # Modern Python package metadata
 └── README.md           # This file

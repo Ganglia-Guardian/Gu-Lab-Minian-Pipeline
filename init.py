@@ -27,10 +27,10 @@ def setup():
     print("Setting up your minian pipeline for the first time!")
     print("This first part might take ~5 minutes...")
     run("conda init")
-    run("conda env create -f winenv.yml --solver=libmamba", check=True)
+    run("conda env create -f environment.yml --solver=libmamba", check=True)
     run(f"conda run -n {env_name} pip install -e .", check=True)
     # Test minian
-    result = run(f"conda run -n {env_name} python st.py")
+    result = run(f"conda run -n {env_name} python env_test.py minian")
     if result.returncode == 0:
         print("Minian installation successful")
         run(f"conda run -n {env_name} pip install shot-scraper", check=True)

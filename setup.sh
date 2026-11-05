@@ -22,7 +22,7 @@ checkenv
 echo "Setting up your minian pipeline for the first time!"
 echo "This first part might take ~5 minutes..."
 conda init
-conda env create -f winenv.yml --solver=libmamba
+conda env create -f environment.yml --solver=libmamba
 conda activate minian-gu-lab
 #DEBUG
 # echo "${BLUE}Minian setup done, moving to other stuff. Pres any key to continue...${NC}"
@@ -31,7 +31,7 @@ conda activate minian-gu-lab
 pip install -e .
 pip install shot-scraper
 #Test minian
-if python st.py; then
+if python env_test.py minian; then
   echo "Minian installation successful"
   pip install shot-scraper
   python -m playwright install chromium

@@ -36,7 +36,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           mamba-version: "*"
           activate-environment: minian
-          environment-file: environment.yml
+          environment-file: old.environment.yml  # environment.yml pins Windows-only builds
       - name: Install test dependencies
         run: |
           conda install -c conda-forge black==20.8b1 click==8.0.4 pytest==7.0.1 pytest-cov pytest-rerunfailures coverage==6.3.3

@@ -111,9 +111,16 @@ def find_conda():
 
 
 def conda_version(conda):
+    """
+    Assumes format of 'conda <major>.<minor>.<patch>'.
+    """
     out = run([conda, "--version"], capture=True).stdout
-    match = re.search(r"(\d+)\.(\d+)", out)
-    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+    try:
+        major, minor = out.split()[-1].split(".")[:2]
+        return int(major), int(minor)
+    except (ValueError, IndexError):
+        return (0, 0)
+
 
 
 def env_name_from(env_file):

@@ -14,8 +14,9 @@ It follows the README setup steps:
     6. check GPU / CUDA support (env_test.py cuda) - optional, CPU fallback otherwise
     7. optionally make your personal *_local.ipynb copy of the pipeline template
 
-Every step calls the environment's own python directly, so nothing depends on
-"conda activate" and the script behaves the same in both prompts.
+The environment is activated once through "conda run" and its variables are
+reused for every later step, so the script never needs "conda activate" in
+the calling shell and behaves the same in both prompts.
 
 Options (all optional):
     --yes              never ask; keep an existing environment and skip the notebook copy
@@ -56,10 +57,18 @@ def fail(msg):
     sys.exit(1)
 
 
-def run(cmd, check=True, capture=False):
-    """Run a command (list of args) from the repo root, streaming its output."""
+ACTIVE_ENV = None  # environment variables of the activated conda env, set by activate()
+
+
+def run(cmd, check=True, capture=False, activated=True):
+    """Run a command (list of args) from the repo root, streaming its output.
+
+    Once activate() has run, commands get the activated env's variables,
+    unless activated=False (used to test what an unactivated kernel sees).
+    """
     say("  $ " + subprocess.list2cmdline(cmd), GREEN)
     result = subprocess.run(cmd, cwd=REPO, text=True,
+                            env=ACTIVE_ENV if activated else None,
                             capture_output=capture)
     if check and result.returncode != 0:
         if capture:
@@ -120,15 +129,79 @@ def env_exists(conda, name):
     return any(os.path.basename(os.path.normpath(p)) == name for p in envs)
 
 
-def env_python(conda, name):
-    """Path of the python that 'conda activate <name>' would give."""
-    result = run([conda, "run", "-n", name, "python", "-c",
-                  "import sys; print(sys.executable)"], check=False, capture=True)
-    lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-    if result.returncode != 0 or not lines or not os.path.exists(lines[-1]):
+def activate(conda, name):
+    """
+    Return the env's python and capture the variables 'conda activate <name>'
+    sets, so later commands run exactly as in an activated prompt.
+
+    Activation matters: it puts <env>\\Library\\bin on PATH and runs the
+    packages' activate.d scripts. Without it, CuPy cannot find the NVRTC
+    DLLs from cudatoolkit and every GPU kernel fails to compile.
+    """
+    global ACTIVE_ENV
+    marker = "@@ENV@@"
+    probe = ("import json, os, sys; "
+             f"print('{marker}' + json.dumps({{'python': sys.executable, 'env': dict(os.environ)}}))")
+    result = run([conda, "run", "-n", name, "python", "-c", probe], check=False, capture=True)
+    payload = next((l[len(marker):] for l in result.stdout.splitlines() if l.startswith(marker)), None)
+    if result.returncode != 0 or payload is None:
         print(result.stdout, result.stderr)
-        fail(f"could not find python inside the '{name}' environment.")
-    return lines[-1]
+        fail(f"could not activate the '{name}' environment.")
+    info = json.loads(payload)
+    ACTIVE_ENV = info["env"]
+    return info["python"]
+
+
+# Runs at every interpreter start in the env (via a .pth file), before any user
+# import. Kept free of non-stdlib imports and safe to run more than once.
+CUDA_HOOK = '''\
+"""
+Installed by setup_repo.py. Does for CuPy what "conda activate" does.
+
+cupy's conda activation sets CUDA_PATH to the env and puts <env>\\\\Library\\\\bin on
+PATH. Jupyter kernels (VS Code, notebook) often start the env's python without
+activating it; CuPy then follows a system-wide CUDA_PATH (e.g. a CUDA 12 install),
+cannot load the env's NVRTC, and every GPU kernel fails to compile, so the
+pipeline silently falls back to the CPU. This must run before anything imports
+cupy (xarray and dask.array both do), hence the .pth hook.
+"""
+import os
+import sys
+
+
+def _apply():
+    if sys.platform != "win32":
+        return
+    if os.path.normcase(os.environ.get("CUDA_PATH", "")) == os.path.normcase(sys.prefix):
+        return  # already activated
+    lib = os.path.join(sys.prefix, "Library", "bin")
+    try:
+        names = os.listdir(lib)
+    except OSError:
+        return
+    if not any(n.lower().startswith("nvrtc64_") for n in names):
+        return  # no cudatoolkit in this env
+    if "CUDA_PATH" in os.environ:
+        os.environ.setdefault("CONDA_CUPY_CUDA_PATH", os.environ["CUDA_PATH"])
+    os.environ["CUDA_PATH"] = sys.prefix
+    paths = os.environ.get("PATH", "").split(os.pathsep)
+    if os.path.normcase(lib) not in [os.path.normcase(p) for p in paths]:
+        os.environ["PATH"] = os.pathsep.join([lib] + paths)
+
+
+_apply()
+'''
+
+
+def install_cuda_hook(py):
+    """Install CUDA_HOOK into the env's site-packages with a .pth that loads it."""
+    site = run([py, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+               capture=True).stdout.strip().splitlines()[-1]
+    with open(os.path.join(site, "minian_cuda_env.py"), "w", encoding="utf-8") as fh:
+        fh.write(CUDA_HOOK)
+    with open(os.path.join(site, "minian_cuda_env.pth"), "w", encoding="utf-8") as fh:
+        fh.write("import minian_cuda_env\n")
+    say(f"  Installed CUDA startup hook in {site}")
 
 
 def setup_environment(conda, args, env_file, name):
@@ -139,7 +212,7 @@ def setup_environment(conda, args, env_file, name):
         say("  Your conda is older than 23.10; solving may be slow. "
             "If it fails, run 'conda update -n base conda' and try again.", YELLOW)
 
-    create = [conda, "env", "create", "-f", env_file] + solver
+    create = [conda, "env", "create", "-n", name, "-f", env_file] + solver
     if not env_exists(conda, name):
         run(create)
         return
@@ -154,7 +227,7 @@ def setup_environment(conda, args, env_file, name):
                      "k", args.yes).lower()[:1]
 
     if choice == "u":
-        run([conda, "env", "update", "-f", env_file, "--prune"] + solver)
+        run([conda, "env", "update", "-n", name, "-f", env_file, "--prune"] + solver)
     elif choice == "r":
         run([conda, "env", "remove", "-n", name, "-y"])
         run(create)
@@ -194,6 +267,8 @@ def main():
     group.add_argument("--update", action="store_true", help="update an existing environment")
     group.add_argument("--recreate", action="store_true", help="delete and recreate an existing environment")
     parser.add_argument("--name", help="create Minian_pipeline_NAME_local.ipynb from the template")
+    parser.add_argument("--env-name", help="use this environment name instead of the one in the "
+                        "yml (e.g. to test a fresh install without touching minian-gu-lab)")
     parser.add_argument("--skip-plots", action="store_true", help="skip shot-scraper / Playwright")
     args = parser.parse_args()
 
@@ -206,11 +281,11 @@ def main():
     env_file = "environment.yml" if sys.platform == "win32" else "old.environment.yml"
     if not os.path.exists(os.path.join(REPO, env_file)):
         fail(f"{env_file} not found in {REPO}.")
-    name = env_name_from(os.path.join(REPO, env_file))
+    name = args.env_name or env_name_from(os.path.join(REPO, env_file))
 
     step(1, total, f"Conda environment '{name}' from {env_file} (can take 5-15 minutes)")
     setup_environment(conda, args, env_file, name)
-    py = env_python(conda, name)
+    py = activate(conda, name)
     say(f"  Using {py}")
 
     step(2, total, "Installing this repo in editable mode")
@@ -234,7 +309,9 @@ def main():
          "--display-name", KERNEL_DISPLAY.format(name)])
 
     step(6, total, "Checking GPU / CUDA support")
-    gpu = run([py, "env_test.py", "cuda"], check=False).returncode == 0
+    install_cuda_hook(py)
+    # Run unactivated on purpose: that is how Jupyter kernels start the env.
+    gpu = run([py, "env_test.py", "cuda"], check=False, activated=False).returncode == 0
     if not gpu:
         say("  Motion correction will run on the CPU (slower, but works).", YELLOW)
 
